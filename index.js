@@ -13,30 +13,39 @@ app.use(express.json({ type: ['application/json','application/*+json'] }));
 app.use(express.urlencoded({ extended: true }));
 
 // ================== CONFIG ==================
-const SHEET_API   = process.env.SHEET_API;                 // endpoint Apps Script
-const SECRET      = process.env.SHEET_SECRET || 'rahasia-super-aman';
-const MIDTRANS_KEY= process.env.MIDTRANS_KEY;              // Midtrans server key (sandbox/production)
-const SESSION_DIR = process.env.SESSION_DIR || '/data/wwebjs'; // pakai Railway Volume
+const SHEET_API    = process.env.SHEET_API;                 // endpoint Apps Script
+const SECRET       = process.env.SHEET_SECRET || 'rahasia-super-aman';
+const MIDTRANS_KEY = process.env.MIDTRANS_KEY;              // Midtrans Server Key (sandbox/prod)
 
-// ================== WHATSAPP INIT ==================
+// ================== WHATSAPP INIT (tanpa volume) ==================
 const client = new Client({
-  authStrategy: new LocalAuth({
-    clientId: 'pbs-bot-2',
-    dataPath: SESSION_DIR,       // <— simpan sesi di volume agar tidak scan ulang
-  }),
+  authStrategy: new LocalAuth({ clientId: 'pbs-bot' }),     // tanpa dataPath (free plan)
   puppeteer: {
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox']
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  },
+  // cache versi WA Web dari remote agar stabil di server
+  webVersionCache: {
+    type: 'remote',
+    remotePath: 'https://raw.githubusercontent.com/pedroslopez/whatsapp-web.js/remote-web-version/2.2413.51.html'
   }
 });
 
-// simpan QR terakhir untuk /qr
+// simpan QR terakhir untuk route /qr
 let LAST_QR = null;
 client.on('qr', qr => {
   LAST_QR = qr;
   qrcodeTerm.generate(qr, { small: true });
 });
 client.on('ready', () => console.log('✅ WhatsApp bot siap!'));
+
+// ===== Debug & health logs (penting saat hosting) =====
+client.on('loading_screen', (percent, message) => {
+  console.log('loading_screen', percent, message);
+});
+client.on('change_state', state => console.log('state:', state));
+client.on('disconnected', reason => console.log('disconnected:', reason));
+client.on('auth_failure', m => console.error('auth_failure:', m));
 
 // ================== HELPER ==================
 const IDR = n => new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR'}).format(Number(n||0));
@@ -111,8 +120,15 @@ function buildDeliveryMessages({ orderId, productName, qty, total, items, kode }
 const ORDERS = new Map();
 
 // ================== COMMAND HANDLER ==================
-client.on('message', async msg => {
+client.on('message', async (msg) => {
   try {
+    console.log('MESSAGE:', msg.from, msg.body);           // debug
+
+    // tester cepat
+    if (msg.body?.trim().toLowerCase() === '#ping') {
+      return msg.reply('pong ✅');
+    }
+
     const body = (msg.body || '').trim();
     if (!body.toLowerCase().startsWith('#buynow')) return;
 
@@ -221,20 +237,30 @@ app.post('/webhook/midtrans', async (req, res) => {
     res.json({ ok:true });
   } catch (e) {
     console.error('Webhook Midtrans error:', e);
-    res.status(200).json({ ok:false, error: String(e) }); // 200 supaya Midtrans tidak retry brutal
+    res.status(200).json({ ok:false, error: String(e) }); // 200 supaya Midtrans tidak retry keras
   }
 });
 
-// ================== ROUTES: QR preview & health ==================
+// ================== ROUTES: QR preview & test send & health ==================
 app.get('/qr', async (req, res) => {
   if (!LAST_QR) return res.status(404).send('QR belum tersedia. Tunggu event "qr" lalu refresh.');
   try {
     const dataUrl = await QRCode.toDataURL(LAST_QR);
     res.set('Content-Type','text/html')
        .send(`<img src="${dataUrl}" style="width:320px;image-rendering:pixelated" />`);
-  } catch (e) {
-    res.status(500).send(String(e));
-  }
+  } catch (e) { res.status(500).send(String(e)); }
+});
+
+// Tes kirim dari server: /send?to=62812xxxx&text=halo
+app.get('/send', async (req, res) => {
+  try {
+    const to   = (req.query.to || '').toString().trim();
+    const text = (req.query.text || 'test').toString();
+    if (!to) return res.status(400).send('Query ?to= nomor wajib');
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    await client.sendMessage(jid, text);
+    res.send('sent');
+  } catch (e) { console.error('send error:', e); res.status(500).send(String(e)); }
 });
 
 app.get('/', (req, res) => res.send('PBS Bot aktif.'));
