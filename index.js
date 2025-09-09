@@ -30,7 +30,8 @@ const EXEC_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 
 /* --------------- Server keepalive + Webhook --------------- */
 const app = express();
-app.use(express.json());
+app.use(express.json({ type: ['application/json','application/*+json'] }));
+app.use(express.urlencoded({ extended: true }));
 app.get("/", (_req,res)=>res.send("OK - PBS Bot is running"));
 app.get("/status", (_req,res)=>res.json({ok:true}));
 
@@ -347,4 +348,52 @@ process.on("SIGINT", async ()=>{
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=> console.log("HTTP keepalive on :", PORT));
+
+/* ==== Admin webhook secret ==== */
+const ADMIN_SECRET = process.env.ADMIN_WEBHOOK_SECRET || "";
+
+/* ==== Helper kirim pesan ke semua admin ==== */
+async function notifyAdmins(text) {
+  for (const jid of ADMIN_JIDS) {
+    try { await client.sendMessage(jid, text); } catch {}
+  }
+}
+
+/* ==== Endpoint: push-reload dari Sheets ==== */
+// POST /admin/reload  {secret: "...", what:"produk|all", note?:string}
+app.post("/admin/reload", async (req, res) => {
+  try {
+    if (!ADMIN_SECRET || req.body?.secret !== ADMIN_SECRET) return res.status(401).send("forbidden");
+    const what = (req.body?.what || "all").toLowerCase();
+    if (what === "produk" || what === "all") {
+      LAST = 0;                      // paksa cache produk kadaluarsa
+      await loadData(true);          // reload produk
+    }
+    // Bisa tambah hal lain kalau perlu
+    if (req.body?.note) await notifyAdmins(`♻️ Reload diminta: ${req.body.note}`);
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error("admin/reload:", e);
+    return res.status(200).json({ ok:false, error: String(e) }); // jangan bikin retrial storm
+  }
+});
+
+/* ==== Endpoint: low-stock alert ==== */
+// POST /admin/lowstock {secret:"...", items:[{kode, ready}]}
+app.post("/admin/lowstock", async (req, res) => {
+  try {
+    if (!ADMIN_SECRET || req.body?.secret !== ADMIN_SECRET) return res.status(401).send("forbidden");
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.json({ ok:true });
+    let msg = ["⚠️ *Low Stock Alert*"];
+    for (const it of items) msg.push(`• ${it.kode}: ready ${it.ready}`);
+    await notifyAdmins(msg.join("\n"));
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error("admin/lowstock:", e);
+    return res.status(200).json({ ok:false, error: String(e) });
+  }
+});
+
+
 client.initialize();
