@@ -21,7 +21,7 @@ const SESSION_DIR = process.env.SESSION_DIR || '/data/wwebjs'; // pakai Railway 
 // ================== WHATSAPP INIT ==================
 const client = new Client({
   authStrategy: new LocalAuth({
-    clientId: 'pbs-bot',
+    clientId: 'pbs-bot-2',
     dataPath: SESSION_DIR,       // <— simpan sesi di volume agar tidak scan ulang
   }),
   puppeteer: {
