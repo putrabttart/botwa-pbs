@@ -7,6 +7,7 @@ import { parse } from "csv-parse/sync";
 import crypto from "crypto";
 import pkg from "whatsapp-web.js";
 const { Client, LocalAuth, MessageMedia } = pkg;
+// NOTE: Node 18+ punya fetch global. Jika env lama, bisa tambah: import fetch from "node-fetch";
 
 /* ---------------- ENV ---------------- */
 const SHEET_URL  = process.env.SHEET_URL || "";                   // CSV publik dari tab Produk
@@ -38,7 +39,7 @@ app.get("/status", (_req,res)=>res.json({ok:true}));
 /* --------------- Utils --------------- */
 const norm = (s="") => s.toString().toLowerCase().normalize("NFKD").replace(/\s+/g, " ").trim();
 const toID = (s="") => s.replace(/\D/g, "");
-const isHttp = (u="") => /^https?:\/\//i.test(u || "");
+const isHttp = (u="") => /^https?:\/\/?/i.test(u || "");
 const IDR = (n) => new Intl.NumberFormat("id-ID", { style:"currency", currency:"IDR", maximumFractionDigits:0 }).format(Number(n||0));
 const paginate = (arr, page=1, per=8) => {
   const total = Math.max(1, Math.ceil(arr.length/per));
@@ -126,7 +127,7 @@ async function releaseStock({ order_id }) {
 /* --------------- Midtrans --------------- */
 function midtransBase(){
   const host = MID_PROD ? "https://api.midtrans.com" : "https://api.sandbox.midtrans.com";
-  const auth = Buffer.from(MID_SKEY+":").toString("base64");
+  const auth = Buffer.from(MID_SKEY + ":").toString("base64");
   return { host, auth };
 }
 async function createMidtransInvoice({ order_id, gross_amount, customer_phone, product_name }) {
@@ -150,6 +151,21 @@ function verifyMidtransSignature({ order_id, status_code, gross_amount, signatur
   const raw = order_id + status_code + gross_amount + MID_SKEY;
   const calc = crypto.createHash("sha512").update(raw).digest("hex");
   return calc === signature_key;
+}
+// Core API: QRIS charge (tanpa Snap)
+async function createMidtransQRISCharge({ order_id, gross_amount }) {
+  const { host, auth } = midtransBase();
+  const payload = {
+    payment_type: "qris",
+    transaction_details: { order_id, gross_amount }
+  };
+  const res = await fetch(host + "/v2/charge", {
+    method: "POST",
+    headers: { "content-type": "application/json", Authorization: `Basic ${auth}` },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error("QRIS charge error: " + res.status + " " + await res.text());
+  return res.json(); // actions (PNG url), qr_string, dll.
 }
 
 // map order -> { chatId, kode, qty, buyerPhone, total? }
@@ -194,7 +210,7 @@ app.post("/webhook/midtrans", async (req,res)=>{
 
     if (status==="settlement" || status==="capture") {
       const meta = ORDERS.get(order_id) || {};
-      // minta akun dari GAS (baris hold->sold) lalu kirim
+      // finalize ke GAS => ubah hold->sold & ambil akun
       const fin = await finalizeStock({ order_id, total: grossStr });
 
       const nowIso = ev.settlement_time || ev.transaction_time || new Date().toISOString();
@@ -214,7 +230,7 @@ app.post("/webhook/midtrans", async (req,res)=>{
       ].join("\n");
 
       const details = (Array.isArray(fin?.items) && fin.items.length)
-        ? formatAccountDetailsNumbered(fin.items)   // ← numbering sesuai isi kolom `data`
+        ? formatAccountDetailsNumberedGlobal(fin.items)   // numbering 1..N (global)
         : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
 
       const finalMsg = header + "\n\n" + details;
@@ -323,25 +339,54 @@ client.on("message", async (msg)=>{
       // 2) Save mapping (untuk webhook)
       ORDERS.set(order_id, { chatId: from, kode: code, qty, buyerPhone: toID(from), total });
 
-      // 3) Create invoice (Midtrans)
+      // 3) MIDTRANS: Charge QRIS & kirim gambar QR
       if (PAY_PROV === "midtrans") {
-        const inv = await createMidtransInvoice({
-          order_id,
-          gross_amount: total,
-          customer_phone: toID(from),
-          product_name: `${p.nama} x ${qty}`
-        });
-        return msg.reply([
-          "🧾 *Order dibuat!*",
-          `Order ID: ${order_id}`,
-          `Produk: ${p.nama} x ${qty}`,
-          `Total: ${IDR(total)}`,
-          "",
-          "Silakan selesaikan pembayaran di tautan berikut:",
-          inv.redirect_url,
-          "",
-          "Setelah pembayaran *berhasil*, bot akan otomatis mengirim produk ke chat ini."
-        ].join("\n"));
+        try {
+          const charge = await createMidtransQRISCharge({ order_id, gross_amount: total });
+
+          // cari URL PNG di 'actions'
+          let qrPngUrl = "";
+          if (Array.isArray(charge?.actions)) {
+            const png = charge.actions.find(a => /png|qr|qris/i.test((a?.name||"") + (a?.url||"")));
+            if (png?.url) qrPngUrl = png.url;
+          }
+          const qrString = charge?.qr_string || "";
+
+          const caption = [
+            "🧾 *Order dibuat!*",
+            `Order ID: ${order_id}`,
+            `Produk: ${p.nama} x ${qty}`,
+            `Total: ${IDR(total)}`,
+            "",
+            "Silakan scan QRIS berikut untuk membayar.",
+            "(Jika QR tidak muncul, balas: *#qris* untuk kirim ulang.)"
+          ].join("\n");
+
+          if (qrPngUrl) {
+            try {
+              const media = await MessageMedia.fromUrl(qrPngUrl);
+              await client.sendMessage(from, media, { caption });
+            } catch {
+              await msg.reply(caption + (qrString ? `\n\nQR String:\n${qrString}` : ""));
+            }
+          } else {
+            await msg.reply(caption + (qrString ? `\n\nQR String:\n${qrString}` : ""));
+          }
+          return;
+        } catch (e) {
+          console.error("qris:", e);
+          // fallback ke Snap jika QRIS bermasalah
+          const inv = await createMidtransInvoice({
+            order_id,
+            gross_amount: total,
+            customer_phone: toID(from),
+            product_name: `${p.nama} x ${qty}`
+          });
+          return msg.reply([
+            "⚠️ QRIS sedang bermasalah, fallback ke link:",
+            inv.redirect_url
+          ].join("\n"));
+        }
       }
 
       return msg.reply("Provider pembayaran belum dikonfigurasi.");
@@ -429,7 +474,7 @@ function indoDateTime(iso) {
 // Mapping tipe pembayaran Midtrans ke label ramah
 function mapPaymentType(ev) {
   const t = (ev?.payment_type || "").toLowerCase();
-  if (t==="qris") return "QRIS auto";
+  if (t==="qris") return "QRIS";
   if (t==="bank_transfer") {
     if (ev?.va_numbers?.[0]?.bank) return `Virtual Account ${ev.va_numbers[0].bank.toUpperCase()}`;
     if (ev?.permata_va_number) return "Virtual Account PERMATA";
@@ -451,35 +496,29 @@ function simpleBuyerId(chatId) {
   return only.slice(-5);
 }
 
-// === Formatter ACCOUNT DETAIL (numbering ke bawah berdasar kolom `data`) ===
-// `items` berasal dari GAS finalize: [{ data: "email: x || password: y || profile: z || pin: 1234" }, ...]
-function formatAccountDetailsNumbered(items) {
+// === Formatter ACCOUNT DETAIL: numbering global 1..N, satu baris per akun ===
+// items = [{ data: "email: x || password: y || profile: z || pin: 1234" }, ...]
+function formatAccountDetailsNumberedGlobal(items) {
   const out = ["( ACCOUNT DETAIL )"];
-  const tidy = (s="") => s.replace(/\s+/g," ").trim();
-  const cap  = (s="") => s.charAt(0).toUpperCase() + s.slice(1);
+  const cap = (s="") => s.charAt(0).toUpperCase() + s.slice(1);
+  let n = 1;
 
-  items.forEach((it, idxItem) => {
+  for (const it of (items || [])) {
     const raw = String(it?.data || "").trim();
-    if (!raw) return;
+    if (!raw) continue;
 
-    const parts = raw
-      .split("||")
+    const parts = raw.split("||")
       .map(p => p.trim())
       .filter(Boolean)
       .map(p => {
-        // normalisasi "key : value" / "key = value" → "Key: value"
         const m = p.match(/^([^:=]+)\s*[:=]\s*(.+)$/);
         if (m) return `${cap(m[1].trim())}: ${m[2].trim()}`;
-        return tidy(p); // potongan bebas tanpa key
+        return p;
       });
 
-    // Numbering ke bawah, reset tiap akun
-    for (let i = 0; i < parts.length; i++) {
-      out.push(`${i+1}. ${parts[i]}`);
-    }
-    if (idxItem < items.length - 1) out.push(""); // pemisah antar akun
-  });
-
+    out.push(`${n}. ${parts.join(" | ")}`);
+    n++;
+  }
   return out.join("\n");
 }
 
