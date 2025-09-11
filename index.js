@@ -340,54 +340,65 @@ client.on("message", async (msg)=>{
       ORDERS.set(order_id, { chatId: from, kode: code, qty, buyerPhone: toID(from), total });
 
       // 3) MIDTRANS: Charge QRIS & kirim gambar QR
-      if (PAY_PROV === "midtrans") {
-        try {
-          const charge = await createMidtransQRISCharge({ order_id, gross_amount: total });
+if (PAY_PROV === "midtrans") {
+  try {
+    const charge = await createMidtransQRISCharge({ order_id, gross_amount: total });
 
-          // cari URL PNG di 'actions'
-          let qrPngUrl = "";
-          if (Array.isArray(charge?.actions)) {
-            const png = charge.actions.find(a => /png|qr|qris/i.test((a?.name||"") + (a?.url||"")));
-            if (png?.url) qrPngUrl = png.url;
-          }
-          const qrString = charge?.qr_string || "";
+    // 1) Ambil URL link dari actions (kalau ada)
+    let payLink = "";
+    if (Array.isArray(charge?.actions)) {
+      // urutan preferensi: desktop_web > mobile_web > deeplink > fallback pertama yang ada
+      const prefer = (names) => charge.actions.find(a => names.some(n => (a?.name||"").toLowerCase().includes(n)));
+      const a1 = prefer(["desktop", "web"]);
+      const a2 = prefer(["mobile"]);
+      const a3 = prefer(["deeplink"]);
+      const aAny = charge.actions[0];
+      payLink = (a1?.url || a2?.url || a3?.url || aAny?.url || "");
+    }
 
-          const caption = [
-            "🧾 *Order dibuat!*",
-            `Order ID: ${order_id}`,
-            `Produk: ${p.nama} x ${qty}`,
-            `Total: ${IDR(total)}`,
-            "",
-            "Silakan scan QRIS berikut untuk membayar.",
-            "(Jika QR tidak muncul, balas: *#qris* untuk kirim ulang.)"
-          ].join("\n");
+    // 2) Render QR dari qr_string → PNG
+    const qrString = charge?.qr_string || "";
+    let media = null;
+    if (qrString) {
+      const buf = await QR.toBuffer(qrString, { type: "png", width: 512, margin: 1 });
+      const b64 = buf.toString("base64");
+      media = new MessageMedia("image/png", b64, `qris-${order_id}.png`);
+    }
 
-          if (qrPngUrl) {
-            try {
-              const media = await MessageMedia.fromUrl(qrPngUrl);
-              await client.sendMessage(from, media, { caption });
-            } catch {
-              await msg.reply(caption + (qrString ? `\n\nQR String:\n${qrString}` : ""));
-            }
-          } else {
-            await msg.reply(caption + (qrString ? `\n\nQR String:\n${qrString}` : ""));
-          }
-          return;
-        } catch (e) {
-          console.error("qris:", e);
-          // fallback ke Snap jika QRIS bermasalah
-          const inv = await createMidtransInvoice({
-            order_id,
-            gross_amount: total,
-            customer_phone: toID(from),
-            product_name: `${p.nama} x ${qty}`
-          });
-          return msg.reply([
-            "⚠️ QRIS sedang bermasalah, fallback ke link:",
-            inv.redirect_url
-          ].join("\n"));
-        }
-      }
+    // 3) Caption yang rapi + link (jika ada)
+    const caption = [
+      "🧾 *Order dibuat!*",
+      `Order ID: ${order_id}`,
+      `Produk: ${p.nama} x ${qty}`,
+      `Total: ${IDR(total)}`,
+      "",
+      "Silakan scan QRIS berikut untuk membayar.",
+      payLink ? `Link Checkout: ${payLink}` : "(Jika QR tidak muncul, balas: *#qris* untuk kirim ulang.)"
+    ].join("\n");
+
+    if (media) {
+      await client.sendMessage(from, media, { caption });
+    } else {
+      // Jika gagal render PNG, tetap kirim caption + link
+      await msg.reply(caption + (qrString ? `\n\nQR String:\n${qrString}` : ""));
+    }
+    return;
+  } catch (e) {
+    console.error("qris:", e);
+    // Fallback ke Snap bila Core QRIS bermasalah → kirim link
+    const inv = await createMidtransInvoice({
+      order_id,
+      gross_amount: total,
+      customer_phone: toID(from),
+      product_name: `${p.nama} x ${qty}`
+    });
+    return msg.reply([
+      "⚠️ QRIS sedang bermasalah, fallback ke link:",
+      inv.redirect_url
+    ].join("\n"));
+  }
+}
+
 
       return msg.reply("Provider pembayaran belum dikonfigurasi.");
     }
