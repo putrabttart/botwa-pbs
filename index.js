@@ -9,12 +9,12 @@ import pkg from "whatsapp-web.js";
 const { Client, LocalAuth, MessageMedia } = pkg;
 
 /* ---------------- ENV ---------------- */
-const SHEET_URL  = process.env.SHEET_URL || "";
+const SHEET_URL  = process.env.SHEET_URL || "";                   // CSV publik dari tab Produk
 const ADMIN_JIDS = new Set((process.env.ADMINS || "").split(",").map(s=>s.trim()).filter(Boolean));
 const ADMIN_CONTACT = process.env.ADMIN_CONTACT || "";
 const CLIENT_ID = process.env.CLIENT_ID || "botwa-railway";
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";     // https://xxx.up.railway.app
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";        // ex: https://xxx.up.railway.app
 
 // Apps Script (stok & order log)
 const GAS_URL    = process.env.GAS_WEBHOOK_URL || "";
@@ -152,7 +152,7 @@ function verifyMidtransSignature({ order_id, status_code, gross_amount, signatur
   return calc === signature_key;
 }
 
-// map order -> { chatId, kode, qty, buyerPhone } (volatile; bisa juga tulis ke Apps Script)
+// map order -> { chatId, kode, qty, buyerPhone, total? }
 const ORDERS = new Map();
 
 /* --------------- WhatsApp Client --------------- */
@@ -189,24 +189,38 @@ app.post("/webhook/midtrans", async (req,res)=>{
 
     const order_id = ev.order_id;
     const status   = ev.transaction_status; // settlement, capture, deny, cancel, expire, pending
-    const gross    = ev.gross_amount;
+    const grossStr = String(ev.gross_amount || "0");
+    const gross    = Number(grossStr);
 
     if (status==="settlement" || status==="capture") {
-      const fin = await finalizeStock({ order_id, total: gross });
-      if (fin.ok) {
-        const meta = ORDERS.get(order_id);
-        if (meta?.chatId) {
-          const items = fin.items || [];
-          await client.sendMessage(meta.chatId, [
-            "✅ *Pembayaran Berhasil*",
-            `Order ID: ${order_id}`,
-            `Produk: ${meta.kode} x ${meta.qty}`,
-            `Total: ${IDR(gross)}`,
-            "",
-            items.length ? "*Detail Produk / Akun:*" : "*Catatan:* stok akan dikirim manual oleh admin."
-          ].join("\n"));
-          for (const it of items) await client.sendMessage(meta.chatId, "• " + it.data);
-        }
+      const meta = ORDERS.get(order_id) || {};
+      // minta akun dari GAS (baris hold->sold) lalu kirim
+      const fin = await finalizeStock({ order_id, total: grossStr });
+
+      const nowIso = ev.settlement_time || ev.transaction_time || new Date().toISOString();
+      const header = [
+        "─ ( TRANSAKSI SUKSES )─",
+        `; Pay ID : ${ev.transaction_id || "-"}`,
+        `; Kode Unik : ${order_id}`,
+        `; Nama Produk : ${await namaProdukDariKode(meta.kode) || (meta.kode || "-").toUpperCase()}`,
+        `; ID Buyer : ${simpleBuyerId(meta.chatId)}`,
+        `; Nomor Buyer : ${toID(meta.chatId)}`,
+        `; Jumlah Beli : ${meta.qty || 1}`,
+        `; Jumlah Akun didapat : ${meta.qty || 1}`,
+        `; Harga : ${IDR(Math.floor(Number(gross)/(meta.qty||1)))}`,
+        `; Total Dibayar : ${IDR(gross)}`,
+        `; Methode Pay : ${mapPaymentType(ev)}`,
+        `; Tanggal/Jam Transaksi : ${indoDateTime(nowIso)}`
+      ].join("\n");
+
+      const details = (Array.isArray(fin?.items) && fin.items.length)
+        ? formatAccountDetailsNumbered(fin.items)   // ← numbering sesuai isi kolom `data`
+        : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
+
+      const finalMsg = header + "\n\n" + details;
+
+      if (meta?.chatId) {
+        await client.sendMessage(meta.chatId, finalMsg);
       }
       return res.send("ok");
     }
@@ -306,8 +320,8 @@ client.on("message", async (msg)=>{
       const reserve = await reserveStock({ kode: code, qty, order_id, buyer_jid: from });
       if (!reserve.ok) return msg.reply("Maaf, stok tidak mencukupi. Coba kurangi jumlah / pilih produk lain.");
 
-      // 2) Save mapping (untuk reply cepat setelah webhook)
-      ORDERS.set(order_id, { chatId: from, kode: code, qty, buyerPhone: toID(from) });
+      // 2) Save mapping (untuk webhook)
+      ORDERS.set(order_id, { chatId: from, kode: code, qty, buyerPhone: toID(from), total });
 
       // 3) Create invoice (Midtrans)
       if (PAY_PROV === "midtrans") {
@@ -369,12 +383,11 @@ app.post("/admin/reload", async (req, res) => {
       LAST = 0;                      // paksa cache produk kadaluarsa
       await loadData(true);          // reload produk
     }
-    // Bisa tambah hal lain kalau perlu
     if (req.body?.note) await notifyAdmins(`♻️ Reload diminta: ${req.body.note}`);
     return res.json({ ok:true });
   } catch (e) {
     console.error("admin/reload:", e);
-    return res.status(200).json({ ok:false, error: String(e) }); // jangan bikin retrial storm
+    return res.status(200).json({ ok:false, error: String(e) }); // tidak memicu retrial storm
   }
 });
 
@@ -395,5 +408,86 @@ app.post("/admin/lowstock", async (req, res) => {
   }
 });
 
-
 client.initialize();
+
+/* ==================== Helpers (format & mapping) ==================== */
+
+// Nama bulan Indonesia + jam “pukul HH.MM”
+function indoDateTime(iso) {
+  try {
+    const d = new Date(iso);
+    const bln = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
+    const tgl = d.getDate();
+    const bulan = bln[d.getMonth()];
+    const th = d.getFullYear();
+    const hh = String(d.getHours()).padStart(2,"0");
+    const mm = String(d.getMinutes()).padStart(2,"0");
+    return `${tgl} ${bulan} ${th} pukul ${hh}.${mm}`;
+  } catch { return iso; }
+}
+
+// Mapping tipe pembayaran Midtrans ke label ramah
+function mapPaymentType(ev) {
+  const t = (ev?.payment_type || "").toLowerCase();
+  if (t==="qris") return "QRIS auto";
+  if (t==="bank_transfer") {
+    if (ev?.va_numbers?.[0]?.bank) return `Virtual Account ${ev.va_numbers[0].bank.toUpperCase()}`;
+    if (ev?.permata_va_number) return "Virtual Account PERMATA";
+    return "Virtual Account";
+  }
+  if (t==="echannel") return "Mandiri Bill";
+  if (t==="gopay") return "GoPay";
+  if (t==="credit_card") return "Kartu Kredit";
+  if (t==="shopeepay") return "ShopeePay";
+  if (t==="alfamart" || t==="indomaret") return t.charAt(0).toUpperCase()+t.slice(1);
+  return t || "-";
+}
+
+// Buat ID buyer sederhana dari chatId (non-sensitif)
+function simpleBuyerId(chatId) {
+  if (!chatId) return "-";
+  const only = toID(chatId);
+  if (!only) return "-";
+  return only.slice(-5);
+}
+
+// === Formatter ACCOUNT DETAIL (numbering ke bawah berdasar kolom `data`) ===
+// `items` berasal dari GAS finalize: [{ data: "email: x || password: y || profile: z || pin: 1234" }, ...]
+function formatAccountDetailsNumbered(items) {
+  const out = ["( ACCOUNT DETAIL )"];
+  const tidy = (s="") => s.replace(/\s+/g," ").trim();
+  const cap  = (s="") => s.charAt(0).toUpperCase() + s.slice(1);
+
+  items.forEach((it, idxItem) => {
+    const raw = String(it?.data || "").trim();
+    if (!raw) return;
+
+    const parts = raw
+      .split("||")
+      .map(p => p.trim())
+      .filter(Boolean)
+      .map(p => {
+        // normalisasi "key : value" / "key = value" → "Key: value"
+        const m = p.match(/^([^:=]+)\s*[:=]\s*(.+)$/);
+        if (m) return `${cap(m[1].trim())}: ${m[2].trim()}`;
+        return tidy(p); // potongan bebas tanpa key
+      });
+
+    // Numbering ke bawah, reset tiap akun
+    for (let i = 0; i < parts.length; i++) {
+      out.push(`${i+1}. ${parts[i]}`);
+    }
+    if (idxItem < items.length - 1) out.push(""); // pemisah antar akun
+  });
+
+  return out.join("\n");
+}
+
+// Ambil nama produk dari kode (untuk header)
+async function namaProdukDariKode(kode) {
+  try {
+    await loadData();
+    const p = byKode(kode);
+    return p?.nama || null;
+  } catch { return null; }
+}
