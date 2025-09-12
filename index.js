@@ -152,6 +152,59 @@ function verifyMidtransSignature({ order_id, status_code, gross_amount, signatur
   const calc = crypto.createHash("sha512").update(raw).digest("hex");
   return calc === signature_key;
 }
+// ----- Parse & pretty print akun -----
+
+// normalisasi key (email/e-mail/username → email, pass/pw → password, profil → profile, dll)
+function normalizeKey(k="") {
+  const s = k.toString().trim().toLowerCase();
+  if (/^e(-)?mail$|^email$|^user(name)?$/.test(s)) return "email";
+  if (/^pass(word)?$|^pw$|^sandi$/.test(s)) return "password";
+  if (/^profil(e)?$/.test(s)) return "profile";
+  if (/^pin$/.test(s)) return "pin";
+  if (/^redeem(code)?$|^kode ?redeem$/.test(s)) return "redeem";
+  if (/^durasi$|^masa ?aktif$|^valid$/.test(s)) return "duration";
+  return s; // biarkan key lain tetap ada
+}
+
+// parse "k:v || k=v || bebas" → object key→value
+function parseKV(raw="") {
+  const kv = {};
+  const parts = String(raw).split("||").map(s=>s.trim()).filter(Boolean);
+  for (const p of parts) {
+    const m = p.match(/^([^:=]+)\s*[:=]\s*(.+)$/);
+    if (m) {
+      kv[normalizeKey(m[1])] = m[2].trim();
+    } else {
+      // potongan tanpa key → simpan sebagai "info"
+      kv.info = kv.info ? (kv.info + " | " + p) : p;
+    }
+  }
+  return kv;
+}
+
+// format bertumpuk + numbering 1..N (satu pesan saja)
+function formatAccountDetailsStacked(items=[]) {
+  const lines = ["( ACCOUNT DETAIL )"];
+  items.forEach((it, idx) => {
+    const kv = parseKV(it?.data || "");
+    const n = idx + 1;
+    // urutan yang diutamakan
+    lines.push(`${n}. Email: ${kv.email ?? "-"}`);
+    if (kv.password) lines.push(`- Password: ${kv.password}`);
+    if (kv.profile)  lines.push(`- Profile: ${kv.profile}`);
+    if (kv.pin)      lines.push(`- Pin: ${kv.pin}`);
+    if (kv.redeem)   lines.push(`- Redeem: ${kv.redeem}`);
+    if (kv.duration) lines.push(`- Durasi: ${kv.duration}`);
+    // sisanya (key lain yang mungkin ada)
+    const shown = new Set(["email","password","profile","pin","redeem","duration"]);
+    for (const [k,v] of Object.entries(kv)) {
+      if (!shown.has(k) && k !== "info") lines.push(`- ${k[0].toUpperCase()+k.slice(1)}: ${v}`);
+    }
+    if (kv.info) lines.push(`- Info: ${kv.info}`);
+  });
+  return lines.join("\n");
+}
+
 // Core API: QRIS charge (tanpa Snap)
 async function createMidtransQRISCharge({ order_id, gross_amount }) {
   const { host, auth } = midtransBase();
@@ -170,6 +223,8 @@ async function createMidtransQRISCharge({ order_id, gross_amount }) {
 
 // map order -> { chatId, kode, qty, buyerPhone, total? }
 const ORDERS = new Map();
+const SENT_ORDERS = new Set();
+
 
 /* --------------- WhatsApp Client --------------- */
 const client = new Client({
@@ -209,35 +264,42 @@ app.post("/webhook/midtrans", async (req,res)=>{
     const gross    = Number(grossStr);
 
     if (status==="settlement" || status==="capture") {
-      const fin = await finalizeStock({ order_id, total: gross });
-      if (fin.ok) {
-        const meta = ORDERS.get(order_id);
-        if (meta?.chatId) {
-          const items = fin.items || [];
-    
-          // 1) Kirim header transaksi
-          await client.sendMessage(meta.chatId, [
-            "✅ *Pembayaran Berhasil*",
-            `Order ID: ${order_id}`,
-            `Produk: ${meta.kode} x ${meta.qty}`,
-            `Total: ${IDR(gross)}`,
-            "",
-            items.length ? "*Detail Produk / Akun:*" : "*Catatan:* stok akan dikirim manual oleh admin."
-          ].join("\n"));
-    
-          // 2) Kirim akun satu per satu
-          for (const it of items) {
-            await client.sendMessage(meta.chatId, "• " + it.data);
-          }
-    
-          // 3) Kirim template tambahan (after_msg) kalau ada
-          if (fin.after_msg) {
-            await client.sendMessage(meta.chatId, fin.after_msg);
-          }
-        }
+
+  // cegah dobel kirim bila webhook di-retry
+  if (SENT_ORDERS.has(order_id)) return res.send("ok");
+  SENT_ORDERS.add(order_id);
+  setTimeout(() => SENT_ORDERS.delete(order_id), 10 * 60 * 1000); // auto-clear 10 menit
+
+  const fin = await finalizeStock({ order_id, total: grossStr });
+  if (fin?.ok) {
+    const meta = ORDERS.get(order_id);
+    if (meta?.chatId) {
+      const items = fin.items || [];
+
+      // 1) Header transaksi rapi
+      const header = [
+        "✅ *Pembayaran Berhasil*",
+        `Order ID: ${order_id}`,
+        `Produk: ${meta.kode} x ${meta.qty}`,
+        `Total: ${IDR(gross)}`
+      ].join("\n");
+      await client.sendMessage(meta.chatId, header, { linkPreview: false });
+
+      // 2) ACCOUNT DETAIL (satu pesan saja, bertumpuk & bernomor)
+      const detailMsg = items.length
+        ? formatAccountDetailsStacked(items)
+        : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
+      await client.sendMessage(meta.chatId, detailMsg, { linkPreview: false });
+
+      // 3) Template tambahan dari GAS (jika ada)
+      if (fin.after_msg) {
+        await client.sendMessage(meta.chatId, fin.after_msg, { linkPreview: false });
       }
-      return res.send("ok");
     }
+  }
+  return res.send("ok");
+}
+
 
 
     if (status==="expire" || status==="cancel" || status==="deny") {
