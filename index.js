@@ -209,37 +209,36 @@ app.post("/webhook/midtrans", async (req,res)=>{
     const gross    = Number(grossStr);
 
     if (status==="settlement" || status==="capture") {
-      const meta = ORDERS.get(order_id) || {};
-      // finalize ke GAS => ubah hold->sold & ambil akun
-      const fin = await finalizeStock({ order_id, total: grossStr });
-
-      const nowIso = ev.settlement_time || ev.transaction_time || new Date().toISOString();
-      const header = [
-        "─ ( TRANSAKSI SUKSES )─",
-        `; Pay ID : ${ev.transaction_id || "-"}`,
-        `; Kode Unik : ${order_id}`,
-        `; Nama Produk : ${await namaProdukDariKode(meta.kode) || (meta.kode || "-").toUpperCase()}`,
-        `; ID Buyer : ${simpleBuyerId(meta.chatId)}`,
-        `; Nomor Buyer : ${toID(meta.chatId)}`,
-        `; Jumlah Beli : ${meta.qty || 1}`,
-        `; Jumlah Akun didapat : ${meta.qty || 1}`,
-        `; Harga : ${IDR(Math.floor(Number(gross)/(meta.qty||1)))}`,
-        `; Total Dibayar : ${IDR(gross)}`,
-        `; Methode Pay : ${mapPaymentType(ev)}`,
-        `; Tanggal/Jam Transaksi : ${indoDateTime(nowIso)}`
-      ].join("\n");
-
-      const details = (Array.isArray(fin?.items) && fin.items.length)
-        ? formatAccountDetailsNumberedGlobal(fin.items)   // numbering 1..N (global)
-        : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
-
-      const finalMsg = header + "\n\n" + details;
-
-      if (meta?.chatId) {
-        await client.sendMessage(meta.chatId, finalMsg);
+      const fin = await finalizeStock({ order_id, total: gross });
+      if (fin.ok) {
+        const meta = ORDERS.get(order_id);
+        if (meta?.chatId) {
+          const items = fin.items || [];
+    
+          // 1) Kirim header transaksi
+          await client.sendMessage(meta.chatId, [
+            "✅ *Pembayaran Berhasil*",
+            `Order ID: ${order_id}`,
+            `Produk: ${meta.kode} x ${meta.qty}`,
+            `Total: ${IDR(gross)}`,
+            "",
+            items.length ? "*Detail Produk / Akun:*" : "*Catatan:* stok akan dikirim manual oleh admin."
+          ].join("\n"));
+    
+          // 2) Kirim akun satu per satu
+          for (const it of items) {
+            await client.sendMessage(meta.chatId, "• " + it.data);
+          }
+    
+          // 3) Kirim template tambahan (after_msg) kalau ada
+          if (fin.after_msg) {
+            await client.sendMessage(meta.chatId, fin.after_msg);
+          }
+        }
       }
       return res.send("ok");
     }
+
 
     if (status==="expire" || status==="cancel" || status==="deny") {
       await releaseStock({ order_id });
