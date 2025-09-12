@@ -207,6 +207,40 @@ function formatAccountDetailsStacked(items=[]) {
   return lines.join("\n");
 }
 
+// Kotak "TRANSAKSI SUKSES" seperti contoh
+function formatTransaksiSuksesBox({ ev, meta, gross }) {
+  const payId   = ev?.transaction_id || "-";
+  const orderId = ev?.order_id || "-";
+  const product = meta?.product_name || meta?.kode || "-";
+  const idBuyer = simpleBuyerId(meta?.chatId);
+  const noBuyer = toID(meta?.chatId||"");
+  const qty     = Number(meta?.qty||0);
+  const akun    = Number(qty); // sama dengan qty; jika pakai mekanisme lain silakan sesuaikan
+  const harga   = Number(meta?.unit_price||0) || (Number(gross||0) / (qty||1));
+  const total   = Number(gross||0);
+  const payM    = mapPaymentType(ev) || "-";
+  const timeISO = ev?.settlement_time || ev?.transaction_time || new Date().toISOString();
+  const waktu   = indoDateTime(timeISO);
+
+  const lines = [
+    "╭───〔 TRANSAKSI SUKSES 〕─",
+    `: Pay ID : ${payId}`,
+    `: Kode Unik : ${orderId}`,
+    `: Nama Produk : ${product}`,
+    `: ID Buyer : ${idBuyer}`,
+    `: Nomor Buyer : ${noBuyer}`,
+    `: Jumlah Beli : ${qty}`,
+    `: Jumlah Akun didapat : ${akun}`,
+    `: Harga : ${IDR(harga)}`,
+    `: Total Dibayar : ${IDR(total)}`,
+    `: Methode Pay : ${payM}`,
+    `: Tanggal/Jam Transaksi : ${waktu}`,
+    "╰────────────────────────"
+  ];
+  return lines.join("\n");
+}
+
+
 // Core API: QRIS charge (tanpa Snap)
 async function createMidtransQRISCharge({ order_id, gross_amount }) {
   const { host, auth } = midtransBase();
@@ -282,25 +316,23 @@ app.post("/webhook/midtrans", async (req,res)=>{
         if (meta?.chatId) {
           const items = fin.items || [];
 
-          // 1) Header transaksi rapi
-          const header = [
-            "✅ *Pembayaran Berhasil*",
-            `Order ID: ${order_id}`,
-            `Produk: ${meta.kode} x ${meta.qty}`,
-            `Total: ${IDR(gross)}`
-          ].join("\n");
-          await client.sendMessage(meta.chatId, header, { linkPreview: false });
-
-          // 2) ACCOUNT DETAIL (satu pesan saja, bertumpuk & bernomor)
-          const detailMsg = items.length
-            ? formatAccountDetailsStacked(items)
-            : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
-          await client.sendMessage(meta.chatId, detailMsg, { linkPreview: false });
-
-          // 3) Template tambahan dari GAS (jika ada)
-          if (fin.after_msg) {
-            await client.sendMessage(meta.chatId, fin.after_msg, { linkPreview: false });
-          }
+         // 1) Kartu “TRANSAKSI SUKSES”
+        const box = formatTransaksiSuksesBox({ ev, meta, gross });
+        await client.sendMessage(meta.chatId, box, { linkPreview: false });
+        
+        // 2) ACCOUNT DETAIL (satu pesan, rapi bertumpuk & bernomor)
+        const detailMsg = items.length
+          ? formatAccountDetailsStacked(items)
+          : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
+        await client.sendMessage(meta.chatId, detailMsg, { linkPreview: false });
+        
+        // 3) Template tambahan dari GAS (jika ada)
+        if (fin.after_msg) {
+          await client.sendMessage(meta.chatId, fin.after_msg, { linkPreview: false });
+        }
+        
+        // 4) Bersihkan cache QR (untuk #qris)
+        LAST_QR.delete(meta.chatId);
         }
       }
       return res.send("ok");
@@ -434,7 +466,16 @@ client.on("message", async (msg)=>{
       if (!reserve.ok) { await msg.reply("Maaf, stok tidak mencukupi. Coba kurangi jumlah / pilih produk lain."); await msg.react("✅").catch(()=>{}); return; }
 
       // 2) Save mapping (untuk webhook)
-      ORDERS.set(order_id, { chatId: from, kode: code, qty, buyerPhone: toID(from), total });
+      ORDERS.set(order_id, {
+        chatId: from,
+        kode: code,
+        qty,
+        buyerPhone: toID(from),
+        total,
+        unit_price: Number(p.harga)||0,
+        product_name: p.nama||code
+      });
+
 
       // 3) MIDTRANS: Charge QRIS & kirim gambar QR
       if (PAY_PROV === "midtrans") {
