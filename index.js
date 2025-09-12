@@ -39,7 +39,7 @@ app.get("/status", (_req,res)=>res.json({ok:true}));
 /* --------------- Utils --------------- */
 const norm = (s="") => s.toString().toLowerCase().normalize("NFKD").replace(/\s+/g, " ").trim();
 const toID = (s="") => s.replace(/\D/g, "");
-const isHttp = (u="") => /^https?:\/\/?/i.test(u || "");
+const isHttp = (u="") => /^https?:\/\//i.test(u || "");
 const IDR = (n) => new Intl.NumberFormat("id-ID", { style:"currency", currency:"IDR", maximumFractionDigits:0 }).format(Number(n||0));
 const paginate = (arr, page=1, per=8) => {
   const total = Math.max(1, Math.ceil(arr.length/per));
@@ -152,6 +152,7 @@ function verifyMidtransSignature({ order_id, status_code, gross_amount, signatur
   const calc = crypto.createHash("sha512").update(raw).digest("hex");
   return calc === signature_key;
 }
+
 // ----- Parse & pretty print akun -----
 
 // normalisasi key (email/e-mail/username → email, pass/pw → password, profil → profile, dll)
@@ -166,10 +167,13 @@ function normalizeKey(k="") {
   return s; // biarkan key lain tetap ada
 }
 
-// parse "k:v || k=v || bebas" → object key→value
+// parse "k:v || k=v || '|' atau ','" → object key→value
 function parseKV(raw="") {
   const kv = {};
-  const parts = String(raw).split("||").map(s=>s.trim()).filter(Boolean);
+  const parts = String(raw)
+    .split(/\|\||\||,/)
+    .map(s=>s.trim())
+    .filter(Boolean);
   for (const p of parts) {
     const m = p.match(/^([^:=]+)\s*[:=]\s*(.+)$/);
     if (m) {
@@ -188,17 +192,15 @@ function formatAccountDetailsStacked(items=[]) {
   items.forEach((it, idx) => {
     const kv = parseKV(it?.data || "");
     const n = idx + 1;
-    // urutan yang diutamakan
     lines.push(`${n}. Email: ${kv.email ?? "-"}`);
     if (kv.password) lines.push(`- Password: ${kv.password}`);
     if (kv.profile)  lines.push(`- Profile: ${kv.profile}`);
     if (kv.pin)      lines.push(`- Pin: ${kv.pin}`);
     if (kv.redeem)   lines.push(`- Redeem: ${kv.redeem}`);
     if (kv.duration) lines.push(`- Durasi: ${kv.duration}`);
-    // sisanya (key lain yang mungkin ada)
-    const shown = new Set(["email","password","profile","pin","redeem","duration"]);
+    const shown = new Set(["email","password","profile","pin","redeem","duration","info"]);
     for (const [k,v] of Object.entries(kv)) {
-      if (!shown.has(k) && k !== "info") lines.push(`- ${k[0].toUpperCase()+k.slice(1)}: ${v}`);
+      if (!shown.has(k)) lines.push(`- ${k[0].toUpperCase()+k.slice(1)}: ${v}`);
     }
     if (kv.info) lines.push(`- Info: ${kv.info}`);
   });
@@ -225,6 +227,10 @@ async function createMidtransQRISCharge({ order_id, gross_amount }) {
 const ORDERS = new Map();
 const SENT_ORDERS = new Set();
 
+// daftar command yg valid
+const COMMANDS = [
+  "#menu", "#ping", "#kategori", "#list", "#harga", "#detail", "#beli", "#buynow"
+];
 
 /* --------------- WhatsApp Client --------------- */
 const client = new Client({
@@ -265,42 +271,40 @@ app.post("/webhook/midtrans", async (req,res)=>{
 
     if (status==="settlement" || status==="capture") {
 
-  // cegah dobel kirim bila webhook di-retry
-  if (SENT_ORDERS.has(order_id)) return res.send("ok");
-  SENT_ORDERS.add(order_id);
-  setTimeout(() => SENT_ORDERS.delete(order_id), 10 * 60 * 1000); // auto-clear 10 menit
+      // cegah dobel kirim bila webhook di-retry
+      if (SENT_ORDERS.has(order_id)) return res.send("ok");
+      SENT_ORDERS.add(order_id);
+      setTimeout(() => SENT_ORDERS.delete(order_id), 10 * 60 * 1000); // auto-clear 10 menit
 
-  const fin = await finalizeStock({ order_id, total: grossStr });
-  if (fin?.ok) {
-    const meta = ORDERS.get(order_id);
-    if (meta?.chatId) {
-      const items = fin.items || [];
+      const fin = await finalizeStock({ order_id, total: grossStr });
+      if (fin?.ok) {
+        const meta = ORDERS.get(order_id);
+        if (meta?.chatId) {
+          const items = fin.items || [];
 
-      // 1) Header transaksi rapi
-      const header = [
-        "✅ *Pembayaran Berhasil*",
-        `Order ID: ${order_id}`,
-        `Produk: ${meta.kode} x ${meta.qty}`,
-        `Total: ${IDR(gross)}`
-      ].join("\n");
-      await client.sendMessage(meta.chatId, header, { linkPreview: false });
+          // 1) Header transaksi rapi
+          const header = [
+            "✅ *Pembayaran Berhasil*",
+            `Order ID: ${order_id}`,
+            `Produk: ${meta.kode} x ${meta.qty}`,
+            `Total: ${IDR(gross)}`
+          ].join("\n");
+          await client.sendMessage(meta.chatId, header, { linkPreview: false });
 
-      // 2) ACCOUNT DETAIL (satu pesan saja, bertumpuk & bernomor)
-      const detailMsg = items.length
-        ? formatAccountDetailsStacked(items)
-        : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
-      await client.sendMessage(meta.chatId, detailMsg, { linkPreview: false });
+          // 2) ACCOUNT DETAIL (satu pesan saja, bertumpuk & bernomor)
+          const detailMsg = items.length
+            ? formatAccountDetailsStacked(items)
+            : "( ACCOUNT DETAIL )\n- Stok akan dikirim manual oleh admin.";
+          await client.sendMessage(meta.chatId, detailMsg, { linkPreview: false });
 
-      // 3) Template tambahan dari GAS (jika ada)
-      if (fin.after_msg) {
-        await client.sendMessage(meta.chatId, fin.after_msg, { linkPreview: false });
+          // 3) Template tambahan dari GAS (jika ada)
+          if (fin.after_msg) {
+            await client.sendMessage(meta.chatId, fin.after_msg, { linkPreview: false });
+          }
+        }
       }
+      return res.send("ok");
     }
-  }
-  return res.send("ok");
-}
-
-
 
     if (status==="expire" || status==="cancel" || status==="deny") {
       await releaseStock({ order_id });
@@ -320,28 +324,45 @@ client.on("message", async (msg)=>{
     const from = msg.from;
     if (msg.isStatus) return;
 
-    if (/^#menu$/i.test(text)) return msg.reply([
-      "📜 *Menu Bot*",
-      "• #ping",
-      "• #kategori",
-      "• #list [kategori] [hal]",
-      "• #harga <keyword>",
-      "• #detail <kode>",
-      "• #beli <kode>",
-      "• #buynow <kode> <jumlah>",
-      ADMIN_JIDS.has(from) ? "• #refresh (admin)" : null
-    ].filter(Boolean).join("\n"));
+    // reaksi loading
+    try { await msg.react("⏳"); } catch {}
 
-    if (/^#ping$/i.test(text)) return msg.reply("Pong ✅ Bot aktif.");
+    if (/^#menu$/i.test(text)) {
+      await msg.reply([
+        "📜 *Menu Bot*",
+        "• #ping",
+        "• #kategori",
+        "• #list [kategori] [hal]",
+        "• #harga <keyword>",
+        "• #detail <kode>",
+        "• #beli <kode>",
+        "• #buynow <kode> <jumlah>",
+        ADMIN_JIDS.has(from) ? "• #refresh (admin)" : null
+      ].filter(Boolean).join("\n"));
+      await msg.react("✅").catch(()=>{});
+      return;
+    }
+
+    if (/^#ping$/i.test(text)) {
+      await msg.reply("Pong ✅ Bot aktif.");
+      await msg.react("✅").catch(()=>{});
+      return;
+    }
 
     if (/^#refresh$/i.test(text)) {
-      if (!ADMIN_JIDS.has(from)) return msg.reply("❌ Hanya admin.");
-      await loadData(true); return msg.reply(`✅ Reload sukses. Items: ${PRODUCTS.length}`);
+      if (!ADMIN_JIDS.has(from)) { await msg.reply("❌ Hanya admin."); await msg.react("✅").catch(()=>{}); return; }
+      await loadData(true);
+      await msg.reply(`✅ Reload sukses. Items: ${PRODUCTS.length}`);
+      await msg.react("✅").catch(()=>{});
+      return;
     }
 
     if (/^#kategori$/i.test(text)) {
-      await loadData(); const cats=categories();
-      return msg.reply(cats.length ? `🗂️ *Kategori*\n• ${cats.join("\n• ")}` : "Belum ada kategori.");
+      await loadData();
+      const cats=categories();
+      await msg.reply(cats.length ? `🗂️ *Kategori*\n• ${cats.join("\n• ")}` : "Belum ada kategori.");
+      await msg.react("✅").catch(()=>{});
+      return;
     }
 
     if (/^#list\b/i.test(text)) {
@@ -352,117 +373,144 @@ client.on("message", async (msg)=>{
       else if (parts.length>=1) { const last=parts[parts.length-1]; if (/^\d+$/.test(last)) { page=Number(last); cat=parts.slice(0,-1).join(" "); } else { cat=parts.join(" "); } }
       let data=PRODUCTS; if (cat) data=data.filter(p=>norm(p.kategori).includes(norm(cat)));
       const { items, page:p, total } = paginate(data, page, 8);
-      if (!items.length) return msg.reply(cat ? `Tidak ada produk untuk kategori *${cat}*.` : "Belum ada produk.");
+      if (!items.length) { await msg.reply(cat ? `Tidak ada produk untuk kategori *${cat}*.` : "Belum ada produk."); await msg.react("✅").catch(()=>{}); return; }
       const chunks=[cardHeader()]; for (const prod of items) chunks.push(cardProduk(prod));
-      return msg.reply(chunks.join("\n\n") + `\n\nHalaman ${p}/${total} — *#list ${cat?cat+" ":""}${p+1}* untuk berikutnya.`);
+      await msg.reply(chunks.join("\n\n") + `\n\nHalaman ${p}/${total} — *#list ${cat?cat+" ":""}${p+1}* untuk berikutnya.`);
+      await msg.react("✅").catch(()=>{});
+      return;
     }
 
     if (/^#(harga|cari)\b/i.test(text)) {
       await loadData();
       const q = text.replace(/^#(harga|cari)\s*/i, "");
-      if (!q) return msg.reply("Format: *#harga <kata kunci>*");
+      if (!q) { await msg.reply("Format: *#harga <kata kunci>*"); await msg.react("✅").catch(()=>{}); return; }
       const found = search(q).slice(0,6);
-      if (!found.length) return msg.reply("❌ Tidak ditemukan.");
+      if (!found.length) { await msg.reply("❌ Tidak ditemukan."); await msg.react("✅").catch(()=>{}); return; }
       const chunks=[cardHeader()]; for (const p of found) chunks.push(cardProduk(p));
-      return msg.reply(chunks.join("\n\n"));
+      await msg.reply(chunks.join("\n\n"));
+      await msg.react("✅").catch(()=>{});
+      return;
     }
 
     if (/^#detail\s+/i.test(text)) {
       await loadData();
       const code = text.split(/\s+/)[1] || "";
-      const p = byKode(code); if (!p) return msg.reply("Kode tidak ditemukan.");
+      const p = byKode(code); if (!p) { await msg.reply("Kode tidak ditemukan."); await msg.react("✅").catch(()=>{}); return; }
       const cap = [cardHeader(), cardProduk(p)].join("\n\n");
-      if (isHttp(p.ikon)) { try{ const media=await MessageMedia.fromUrl(p.ikon); return client.sendMessage(from, media, { caption: cap }); }catch{} }
-      return msg.reply(cap);
+      if (isHttp(p.ikon)) {
+        try{
+          const media=await MessageMedia.fromUrl(p.ikon);
+          await msg.reply(media, undefined, { caption: cap });
+          await msg.react("✅").catch(()=>{});
+          return;
+        }catch{}
+      }
+      await msg.reply(cap);
+      await msg.react("✅").catch(()=>{});
+      return;
     }
 
     if (/^#beli\s+/i.test(text)) {
       await loadData();
       const code = text.split(/\s+/)[1] || "";
-      const p = byKode(code); if (!p) return msg.reply("Kode tidak ditemukan.");
+      const p = byKode(code); if (!p) { await msg.reply("Kode tidak ditemukan."); await msg.react("✅").catch(()=>{}); return; }
       const link = `https://wa.me/${toID(p.wa||ADMIN_CONTACT)}?text=${encodeURIComponent(`Halo admin, saya ingin beli ${p.nama} (kode: ${p.kode}).`)}`;
-      return msg.reply(`Silakan order ke admin:\n${link}`);
+      await msg.reply(`Silakan order ke admin:\n${link}`);
+      await msg.react("✅").catch(()=>{});
+      return;
     }
 
     if (/^#buynow\s+/i.test(text)) {
       await loadData();
       const m = text.match(/^#buynow\s+(\S+)(?:\s+(\d+))?/i);
       const code = m?.[1] || ""; const qty = Number(m?.[2] || "1") || 1;
-      const p = byKode(code); if (!p) return msg.reply("Kode tidak ditemukan. Contoh: *#buynow spo3b 1*");
+      const p = byKode(code); if (!p) { await msg.reply("Kode tidak ditemukan. Contoh: *#buynow spo3b 1*"); await msg.react("✅").catch(()=>{}); return; }
 
       const order_id = `PBS-${Date.now()}`;
       const total = Number(p.harga) * qty;
 
       // 1) Reserve stock
       const reserve = await reserveStock({ kode: code, qty, order_id, buyer_jid: from });
-      if (!reserve.ok) return msg.reply("Maaf, stok tidak mencukupi. Coba kurangi jumlah / pilih produk lain.");
+      if (!reserve.ok) { await msg.reply("Maaf, stok tidak mencukupi. Coba kurangi jumlah / pilih produk lain."); await msg.react("✅").catch(()=>{}); return; }
 
       // 2) Save mapping (untuk webhook)
       ORDERS.set(order_id, { chatId: from, kode: code, qty, buyerPhone: toID(from), total });
 
       // 3) MIDTRANS: Charge QRIS & kirim gambar QR
-if (PAY_PROV === "midtrans") {
-  try {
-    const charge = await createMidtransQRISCharge({ order_id, gross_amount: total });
+      if (PAY_PROV === "midtrans") {
+        try {
+          const charge = await createMidtransQRISCharge({ order_id, gross_amount: total });
 
-    // 1) Ambil URL link dari actions (kalau ada)
-    let payLink = "";
-    if (Array.isArray(charge?.actions)) {
-      // urutan preferensi: desktop_web > mobile_web > deeplink > fallback pertama yang ada
-      const prefer = (names) => charge.actions.find(a => names.some(n => (a?.name||"").toLowerCase().includes(n)));
-      const a1 = prefer(["desktop", "web"]);
-      const a2 = prefer(["mobile"]);
-      const a3 = prefer(["deeplink"]);
-      const aAny = charge.actions[0];
-      payLink = (a1?.url || a2?.url || a3?.url || aAny?.url || "");
+          // 1) Ambil URL link dari actions (kalau ada)
+          let payLink = "";
+          if (Array.isArray(charge?.actions)) {
+            const prefer = (names) => charge.actions.find(a => names.some(n => (a?.name||"").toLowerCase().includes(n)));
+            const a1 = prefer(["desktop", "web"]);
+            const a2 = prefer(["mobile"]);
+            const a3 = prefer(["deeplink"]);
+            const aAny = charge.actions[0];
+            payLink = (a1?.url || a2?.url || a3?.url || aAny?.url || "");
+          }
+
+          // 2) Render QR dari qr_string → PNG
+          const qrString = charge?.qr_string || "";
+          let media = null;
+          if (qrString) {
+            const buf = await QR.toBuffer(qrString, { type: "png", width: 512, margin: 1 });
+            const b64 = buf.toString("base64");
+            media = new MessageMedia("image/png", b64, `qris-${order_id}.png`);
+          }
+
+          // 3) Caption yang rapi + link (jika ada)
+          const caption = [
+            "🧾 *Order dibuat!*",
+            `Order ID: ${order_id}`,
+            `Produk: ${p.nama} x ${qty}`,
+            `Total: ${IDR(total)}`,
+            "",
+            "Silakan scan QRIS berikut untuk membayar.",
+            payLink ? `Link Checkout: ${payLink}` : "(Jika QR tidak muncul, balas: *#buynow* lagi.)"
+          ].join("\n");
+
+          if (media) {
+            await msg.reply(media, undefined, { caption }); // quoted
+          } else {
+            await msg.reply(caption + (qrString ? `\n\nQR String:\n${qrString}` : ""));
+          }
+          await msg.react("✅").catch(()=>{});
+          return;
+        } catch (e) {
+          console.error("qris:", e);
+          // Fallback ke Snap bila Core QRIS bermasalah → kirim link
+          const inv = await createMidtransInvoice({
+            order_id,
+            gross_amount: total,
+            customer_phone: toID(from),
+            product_name: `${p.nama} x ${qty}`
+          });
+          await msg.reply([
+            "⚠️ QRIS sedang bermasalah, fallback ke link:",
+            inv.redirect_url
+          ].join("\n"));
+          await msg.react("✅").catch(()=>{});
+          return;
+        }
+      }
+
+      await msg.reply("Provider pembayaran belum dikonfigurasi.");
+      await msg.react("✅").catch(()=>{});
+      return;
     }
 
-    // 2) Render QR dari qr_string → PNG
-    const qrString = charge?.qr_string || "";
-    let media = null;
-    if (qrString) {
-      const buf = await QR.toBuffer(qrString, { type: "png", width: 512, margin: 1 });
-      const b64 = buf.toString("base64");
-      media = new MessageMedia("image/png", b64, `qris-${order_id}.png`);
-    }
-
-    // 3) Caption yang rapi + link (jika ada)
-    const caption = [
-      "🧾 *Order dibuat!*",
-      `Order ID: ${order_id}`,
-      `Produk: ${p.nama} x ${qty}`,
-      `Total: ${IDR(total)}`,
-      "",
-      "Silakan scan QRIS berikut untuk membayar.",
-      payLink ? `Link Checkout: ${payLink}` : "(Jika QR tidak muncul, balas: *#qris* untuk kirim ulang.)"
-    ].join("\n");
-
-    if (media) {
-      await client.sendMessage(from, media, { caption });
-    } else {
-      // Jika gagal render PNG, tetap kirim caption + link
-      await msg.reply(caption + (qrString ? `\n\nQR String:\n${qrString}` : ""));
-    }
+    // fallback: command tidak dikenali
+    const lower = text.toLowerCase();
+    const suggest = COMMANDS.filter(c => c.includes(lower.replace(/[#\s]+/g,""))).slice(0,4);
+    let help = "❌ Perintah tidak ditemukan.\n";
+    help += "Coba salah satu ini:\n• " + COMMANDS.join("\n• ");
+    if (suggest.length) help = "❌ Perintah tidak ditemukan.\nMungkin maksud Anda:\n• " + suggest.join("\n• ");
+    await msg.reply(help);
+    await msg.react("✅").catch(()=>{});
     return;
-  } catch (e) {
-    console.error("qris:", e);
-    // Fallback ke Snap bila Core QRIS bermasalah → kirim link
-    const inv = await createMidtransInvoice({
-      order_id,
-      gross_amount: total,
-      customer_phone: toID(from),
-      product_name: `${p.nama} x ${qty}`
-    });
-    return msg.reply([
-      "⚠️ QRIS sedang bermasalah, fallback ke link:",
-      inv.redirect_url
-    ].join("\n"));
-  }
-}
-
-
-      return msg.reply("Provider pembayaran belum dikonfigurasi.");
-    }
 
   }catch(e){
     console.error("handler:", e);
@@ -569,16 +617,14 @@ function simpleBuyerId(chatId) {
 }
 
 // === Formatter ACCOUNT DETAIL: numbering global 1..N, satu baris per akun ===
-// items = [{ data: "email: x || password: y || profile: z || pin: 1234" }, ...]
+// (tersisa untuk kompatibilitas; tidak dipakai karena kita pakai formatAccountDetailsStacked)
 function formatAccountDetailsNumberedGlobal(items) {
   const out = ["( ACCOUNT DETAIL )"];
   const cap = (s="") => s.charAt(0).toUpperCase() + s.slice(1);
   let n = 1;
-
   for (const it of (items || [])) {
     const raw = String(it?.data || "").trim();
     if (!raw) continue;
-
     const parts = raw.split("||")
       .map(p => p.trim())
       .filter(Boolean)
@@ -587,7 +633,6 @@ function formatAccountDetailsNumberedGlobal(items) {
         if (m) return `${cap(m[1].trim())}: ${m[2].trim()}`;
         return p;
       });
-
     out.push(`${n}. ${parts.join(" | ")}`);
     n++;
   }
